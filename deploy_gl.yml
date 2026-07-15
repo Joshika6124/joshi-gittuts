@@ -1,0 +1,181 @@
+name: Deploy GLSubstantiation
+on:
+  push:
+    branches:
+      - 'dev-test'
+      - 'uat-test'
+    paths:
+      - 'GLSubstantiation/**'
+      - '.github/workflows/deploy-gl.yml'
+      - '.github/scripts/**'
+  workflow_dispatch:
+
+env:
+  SOLUTION_PATH: GLSubstantiation\Nexus-GLSubstantiation.sln
+  PROJECT_PATH:  GLSubstantiation\GLSubstantiation\GLSubstantiation.csproj
+  PUBLISH_DIR:   ${{ github.workspace }}\publish\GL
+
+jobs:
+  setup-environment:
+    runs-on: [self-hosted, windows]
+    outputs:
+      environment: ${{ steps.set-env.outputs.environment }}
+      site-name: ${{ steps.set-env.outputs.site-name }}
+    steps:
+      - name: Determine environment from branch
+        id: set-env
+        shell: powershell
+        run: |
+          if ("${{ github.ref }}" -eq "refs/heads/dev-test") {
+              echo "environment=DEV" >> $env:GITHUB_OUTPUT
+              echo "site-name=GenixCICD" >> $env:GITHUB_OUTPUT
+          } elseif ("${{ github.ref }}" -eq "refs/heads/uat-test") {
+              echo "environment=UAT" >> $env:GITHUB_OUTPUT
+              echo "site-name=GenixCICD_UAT" >> $env:GITHUB_OUTPUT
+          } else {
+              Write-Error "Unsupported branch: ${{ github.ref }}"
+              exit 1
+          }
+
+  deploy:
+    needs: setup-environment
+    runs-on: [self-hosted, windows]
+    environment: ${{ needs.setup-environment.outputs.environment }}
+    env:
+      SITE_NAME: ${{ needs.setup-environment.outputs.site-name }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup IIS Bindings
+        shell: powershell
+        run: |
+          $siteName = "${{ needs.setup-environment.outputs.site-name }}"
+          $siteBindings = '${{ vars.GENIXCICD_SITE_BINDINGS }}'
+          $scriptPath = "${{ github.workspace }}\.github\scripts\apply-iis-bindings.ps1"
+          
+          Write-Host "Applying bindings to site: $siteName"
+          Write-Host "Bindings: $siteBindings"
+          
+          & $scriptPath -SiteName $siteName -BindingsString $siteBindings
+          
+          if ($LASTEXITCODE -ne 0) {
+              Write-Error "Binding application failed"
+              exit 1
+          }
+
+      - name: Restore
+        shell: powershell
+        run: dotnet restore "${{ env.SOLUTION_PATH }}"
+
+      - name: Build
+        shell: powershell
+        run: dotnet build "${{ env.PROJECT_PATH }}" --configuration Release --no-restore
+
+      - name: Publish
+        shell: powershell
+        run: |
+          dotnet publish "${{ env.PROJECT_PATH }}" `
+            --configuration Release `
+            --output "${{ env.PUBLISH_DIR }}" `
+            --no-build --no-restore
+
+      - name: Deploy to IIS folder
+        shell: powershell
+        run: |
+          $dst = "${{ vars.GLSUBSTANTIATION_DEPLOY_PATH }}"
+          if ($dst) {
+              robocopy "${{ env.PUBLISH_DIR }}" $dst /MIR /XF appsettings.json /NP /R:5 /W:10 /COPY:DAT
+              $robocopyExitCode = $LASTEXITCODE
+              if ($robocopyExitCode -gt 7) { Write-Error "robocopy failed ($robocopyExitCode)"; exit 1 }
+              Write-Host "Deployed to GL: $dst (robocopy exit code: $robocopyExitCode)"
+              exit 0
+          } else { Write-Host "GLSUBSTANTIATION_DEPLOY_PATH not set, skipping IIS deploy." }
+
+      - name: Generate and Deploy appsettings.json
+        shell: powershell
+        run: |
+          $env = "${{ needs.setup-environment.outputs.environment }}"
+          $dst = "${{ vars.GLSUBSTANTIATION_DEPLOY_PATH }}"
+          
+          if (-not $dst) {
+              Write-Host "GLSUBSTANTIATION_DEPLOY_PATH not set, skipping appsettings generation."
+              exit 0
+          }
+          
+          # Determine ports based on environment
+          if ($env -eq "DEV") {
+              $mainPort = "481"
+              $secondaryPort = "480"
+          } elseif ($env -eq "UAT") {
+              $mainPort = "482"
+              $secondaryPort = "483"
+          } else {
+              Write-Error "Unknown environment: $env"
+              exit 1
+          }
+          
+          # Create GL-specific appsettings.json with secrets
+          $appsettings = @{
+              "Logging" = @{
+                  "LogLevel" = @{
+                      "Default" = "Information"
+                      "Microsoft.AspNetCore" = "Warning"
+                  }
+              }
+              "ConnectionStrings" = @{
+                  "DefaultConnection" = "${{ secrets.GL_CONNECTION_STRING }}"
+              }
+              "AllowedHosts" = "*"
+              "kotakAdDomain" = "kgroupuat.com"
+              "enableADLogin" = "false"
+              "version" = 1.0
+              "sessionTimeout" = 15
+              "FilePath" = "C:\Nexus_Documents\"
+              "AppBasePath" = "/GL"
+              "RateLimit" = "100"
+              "Rateperiod" = "360s"
+              "FileUploadSettings" = @{
+                  "MultipartBodyLengthLimit" = 104857600
+              }
+              "LogSettings" = @{
+                  "LogDirectory" = "C:\GLSubstansation_Documents\Logger"
+              }
+              "Batchsize" = 15000
+              "DateValidation" = @{
+                  "Configs" = @{
+                      "CRCU" = @{
+                          "HeaderDateRow" = 9
+                          "HeaderDateColIndex" = 2
+                          "DateColumns" = @()
+                      }
+                      "BACKDATED_CRCU" = @{
+                          "HeaderDateRow" = 9
+                          "HeaderDateColIndex" = 2
+                          "DateColumns" = @()
+                      }
+                      "OWNER" = @{
+                          "HeaderDateRow" = -1
+                          "HeaderDateColIndex" = -1
+                          "DateColumns" = @("TRANBOOKINGDATE", "VALUEDATELASTPOSTINGDATE", "CLEARANCEDATE", "DEAFTRANSFERDATE", "MATURITYDATE", "DATEFORAGEING")
+                      }
+                  }
+              }
+          } | ConvertTo-Json -Depth 10
+          
+          # Save to deployment folder
+          $appsettingsPath = Join-Path $dst "appsettings.json"
+          Set-Content -Path $appsettingsPath -Value $appsettings -Encoding UTF8
+          Write-Host "appsettings.json generated for GL ($env) environment at: $appsettingsPath"
+
+      - name: Copy to GenixCICD drop folder
+        shell: powershell
+        run: |
+          $stamp = Get-Date -Format "yyyyMMdd_HHmmss"
+          $drop  = "${{ vars.GLSUBSTANTIATION_DROP_PATH }}\${{ github.sha }}_$stamp"
+          New-Item -ItemType Directory -Path $drop -Force | Out-Null
+          robocopy "${{ env.PUBLISH_DIR }}" $drop /E /NP /R:5 /W:10 /COPY:DAT
+          $robocopyExitCode = $LASTEXITCODE
+          if ($robocopyExitCode -gt 7) { Write-Error "robocopy to drop folder failed ($robocopyExitCode)"; exit 1 }
+          Write-Host "Artifacts ready at: $drop (robocopy exit code: $robocopyExitCode)"
+          exit 0
