@@ -1,0 +1,202 @@
+﻿name: Deploy Omega (Kotak.Recon)
+on:
+  push:
+    branches:
+      - 'dev-test'
+      - 'uat-test'
+    paths:
+      - 'Kotak.Recon/**'
+      - '.github/workflows/deploy-omega.yml'
+      - '.github/scripts/**'
+  workflow_dispatch:
+
+env:
+  SOLUTION_PATH: Kotak.Recon\Kotak.Recon.sln
+  PROJECT_PATH:  Kotak.Recon\Kotak.Recon.csproj
+  PUBLISH_DIR:   ${{ github.workspace }}\publish\Omega
+
+jobs:
+  setup-environment:
+    runs-on: [self-hosted, windows]
+    outputs:
+      environment: ${{ steps.set-env.outputs.environment }}
+      site-name: ${{ steps.set-env.outputs.site-name }}
+    steps:
+      - name: Determine environment from branch
+        id: set-env
+        shell: powershell
+        run: |
+          if ("${{ github.ref }}" -eq "refs/heads/dev-test") {
+              echo "environment=DEV" >> $env:GITHUB_OUTPUT
+              echo "site-name=GenixCICD" >> $env:GITHUB_OUTPUT
+          } elseif ("${{ github.ref }}" -eq "refs/heads/uat-test") {
+              echo "environment=UAT" >> $env:GITHUB_OUTPUT
+              echo "site-name=GenixCICD_UAT" >> $env:GITHUB_OUTPUT
+          } else {
+              Write-Error "Unsupported branch: ${{ github.ref }}"
+              exit 1
+          }
+
+  deploy:
+    needs: setup-environment
+    runs-on: [self-hosted, windows]
+    environment: ${{ needs.setup-environment.outputs.environment }}
+    env:
+      SITE_NAME: ${{ needs.setup-environment.outputs.site-name }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup IIS Bindings
+        shell: powershell
+        run: |
+          $siteName = "${{ needs.setup-environment.outputs.site-name }}"
+          $siteBindings = '${{ vars.GENIXCICD_SITE_BINDINGS }}'
+          $scriptPath = "${{ github.workspace }}\.github\scripts\apply-iis-bindings.ps1"
+          
+          Write-Host "Applying bindings to site: $siteName"
+          Write-Host "Bindings: $siteBindings"
+          
+          & $scriptPath -SiteName $siteName -BindingsString $siteBindings
+          
+          if ($LASTEXITCODE -ne 0) {
+              Write-Error "Binding application failed"
+              exit 1
+          }
+
+      - name: Restore
+        shell: powershell
+        run: dotnet restore "${{ env.SOLUTION_PATH }}"
+
+      - name: Build
+        shell: powershell
+        run: dotnet build "${{ env.PROJECT_PATH }}" --configuration Release --no-restore
+
+      - name: Publish
+        shell: powershell
+        run: |
+          dotnet publish "${{ env.PROJECT_PATH }}" `
+            --configuration Release `
+            --output "${{ env.PUBLISH_DIR }}" `
+            --no-build --no-restore
+
+      - name: Deploy to IIS folder
+        shell: powershell
+        run: |
+          $dst = "${{ vars.KOTAKRECON_DEPLOY_PATH }}"
+          if ($dst) {
+              robocopy "${{ env.PUBLISH_DIR }}" $dst /MIR /XF appsettings.json /XF nlog.config /XF log4net.config /NP /R:5 /W:10 /COPY:DAT
+              $robocopyExitCode = $LASTEXITCODE
+              if ($robocopyExitCode -gt 7) { Write-Error "robocopy failed ($robocopyExitCode)"; exit 1 }
+              Write-Host "Deployed to Omega: $dst (robocopy exit code: $robocopyExitCode)"
+              exit 0
+          } else { Write-Host "KOTAKRECON_DEPLOY_PATH not set, skipping IIS deploy." }
+
+      - name: Generate and Deploy appsettings.json
+        shell: powershell
+        run: |
+          $env = "${{ needs.setup-environment.outputs.environment }}"
+          $dst = "${{ vars.KOTAKRECON_DEPLOY_PATH }}"
+          
+          if (-not $dst) {
+              Write-Host "KOTAKRECON_DEPLOY_PATH not set, skipping appsettings generation."
+              exit 0
+          }
+          
+          # Determine ports based on environment
+          if ($env -eq "DEV") {
+              $mainPort = "481"
+              $secondaryPort = "480"
+          } elseif ($env -eq "UAT") {
+              $mainPort = "482"
+              $secondaryPort = "483"
+          } else {
+              Write-Error "Unknown environment: $env"
+              exit 1
+          }
+          
+          # Create Omega-specific appsettings.json with secrets
+          $appsettings = @{
+              "App" = @{
+                  "PathBase" = "/Omega"
+              }
+              "Logging" = @{
+                  "LogLevel" = @{
+                      "Default" = "Information"
+                      "Microsoft" = "Warning"
+                      "Microsoft.Hosting.Lifetime" = "Information"
+                  }
+              }
+              "OracleConnectionStrings" = @{
+                  "DefaultConnection" = "${{ secrets.OMEGA_CONNECTION_STRING }}"
+                  "GLConnection" = "${{ secrets.OMEGA_GL_CONNECTION_STRING }}"
+              }
+              "SQLParams" = @{
+                  "BatchSize" = 150000
+                  "BusinessLogic" = $false
+              }
+              "AllowedHosts" = "*"
+              "FilePath" = "C:\Omega_Documents\"
+              "Minutes" = 1
+              "AutoLogoutMinutes" = 15
+              "kotakAdDomain" = "kgroupuat.com"
+              "enableADLogin" = "false"
+              "sysConfig" = "true"
+              "sysdateformat" = "dd-MM-yyyy"
+              "datebaseformat" = "dd-MM-yyyy"
+              "RateLimit" = "100"
+              "Rateperiod" = "360s"
+              "RefreshRateLimit" = 55
+              "RefreshRateperiod" = "60s"
+              "HangfireHour" = "15"
+              "HangfireMinute" = "42"
+              "ETLJobHangfireHour" = "16"
+              "ETLJobHangfireMinute" = "40"
+              "Base2TruncateButton" = $false
+              "NeftRtgsTruncateButton" = $false
+              "PGReconTruncateButton" = $true
+              "FileColumnLength" = @{
+                  "NeftInwardSFMS" = 23
+                  "NeftInwardPH" = 40
+                  "NeftInwardGL" = 13
+                  "NeftOutwardSFMS" = 21
+                  "NeftOutwardPH" = 63
+                  "NeftOutwardGL" = 13
+                  "RtgsInwardSFMS" = 30
+                  "RtgsInwardPH" = 45
+                  "RtgsInwardGL" = 13
+                  "RtgsOutwardSFMS" = 32
+                  "RtgsOutwardPH" = 66
+                  "RtgsOutwardGL" = 13
+              }
+              "SFTPFilePath" = "C:\Omega_Files\"
+              "Quartz" = @{
+                  "FileJobCron" = "0 0/2 * * * ?"
+              }
+              "Oidc" = @{
+                  "Authority" = "https://localhost:$mainPort"
+                  "ClientId" = "OMEGA"
+                  "ClientSecret" = "${{ secrets.OMEGA_CLIENT_SECRET }}"
+                  "SignedOutCallbackPath" = "/signout-callback-oidc"
+              }
+              "Portal" = @{
+                  "BaseUrl" = "https://kotak.genix.com:$mainPort"
+              }
+          } | ConvertTo-Json -Depth 10
+          
+          # Save to deployment folder
+          $appsettingsPath = Join-Path $dst "appsettings.json"
+          Set-Content -Path $appsettingsPath -Value $appsettings -Encoding UTF8
+          Write-Host "appsettings.json generated for Omega ($env) environment at: $appsettingsPath"
+
+      - name: Copy to GenixCICD drop folder
+        shell: powershell
+        run: |
+          $stamp = Get-Date -Format "yyyyMMdd_HHmmss"
+          $drop  = "${{ vars.KOTAKRECON_DROP_PATH }}\${{ github.sha }}_$stamp"
+          New-Item -ItemType Directory -Path $drop -Force | Out-Null
+          robocopy "${{ env.PUBLISH_DIR }}" $drop /E /NP /R:5 /W:10 /COPY:DAT
+          $robocopyExitCode = $LASTEXITCODE
+          if ($robocopyExitCode -gt 7) { Write-Error "robocopy to drop folder failed ($robocopyExitCode)"; exit 1 }
+          Write-Host "Artifacts ready at: $drop (robocopy exit code: $robocopyExitCode)"
+          exit 0
