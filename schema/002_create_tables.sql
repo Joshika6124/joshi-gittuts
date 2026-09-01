@@ -9,3 +9,4 @@ BEGIN
         CreatedAt DATETIME DEFAULT GETDATE()
     );
 END
+--just testing
