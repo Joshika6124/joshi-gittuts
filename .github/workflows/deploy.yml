@@ -1,0 +1,24 @@
+name: Deploy SQL Changes
+
+on:
+  push:
+    branches: [ master ]
+    paths:
+      - 'schema/**.sql'
+      - 'migrations/**.sql'
+
+jobs:
+  deploy:
+    runs-on: self-hosted
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Run SQL scripts
+        shell: pwsh
+        run: |
+          $files = Get-ChildItem -Path schema, migrations -Filter *.sql -Recurse -ErrorAction SilentlyContinue | Sort-Object Name
+          foreach ($file in $files) {
+            Write-Host "Running $($file.FullName)"
+            sqlcmd -S localhost\SQLEXPRESS -E -i $file.FullName
+          }
