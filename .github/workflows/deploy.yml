@@ -2,27 +2,52 @@ name: Deploy SQL Changes
 
 on:
   push:
-    branches: [ master ]
+    branches: [ master, test ]
     paths:
       - 'schema/**.sql'
       - 'migrations/**.sql'
 
 jobs:
-  deploy:
+  validate:
     runs-on: self-hosted
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Run SQL scripts with tracking and validation
+      - name: Validate SQL files are not empty
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $files = Get-ChildItem -Path schema, migrations -Filter *.sql -Recurse -ErrorAction SilentlyContinue
+          foreach ($file in $files) {
+              $content = Get-Content $file.FullName -Raw
+              if ([string]::IsNullOrWhiteSpace($content)) {
+                  Write-Error "VALIDATION FAILED: $($file.Name) is empty."
+                  exit 1
+              }
+          }
+          Write-Host "All files validated successfully."
+
+  execute:
+    runs-on: self-hosted
+    needs: validate
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Ensure tracking table exists
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          sqlcmd -S localhost\SQLEXPRESS -E -i schema\000_create_schema_migrations_table.sql -b
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: Run new or changed SQL files in order
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
           $server = "localhost\SQLEXPRESS"
           $database = "MyAppDB"
-
-          sqlcmd -S $server -E -i schema\000_create_schema_migrations_table.sql -b
-          if ($LASTEXITCODE -ne 0) { Write-Error "Failed to create tracking table"; exit 1 }
 
           $files = Get-ChildItem -Path schema, migrations -Filter *.sql -Recurse -ErrorAction SilentlyContinue |
                    Where-Object { $_.Name -ne "000_create_schema_migrations_table.sql" } |
@@ -30,11 +55,6 @@ jobs:
 
           foreach ($file in $files) {
               $content = Get-Content $file.FullName -Raw
-              if ([string]::IsNullOrWhiteSpace($content)) {
-                  Write-Error "VALIDATION FAILED: $($file.Name) is empty. Stopping pipeline."
-                  exit 1
-              }
-
               $hash = [System.BitConverter]::ToString(
                   [System.Security.Cryptography.SHA256]::Create().ComputeHash(
                       [System.Text.Encoding]::UTF8.GetBytes($content)
@@ -52,16 +72,22 @@ jobs:
 
               Write-Host "RUNNING: $($file.Name)"
               sqlcmd -S $server -E -d $database -i $file.FullName -b
-
               if ($LASTEXITCODE -ne 0) {
-                  Write-Error "EXECUTION FAILED: $($file.Name). Stopping pipeline. No further scripts will run."
+                  Write-Error "EXECUTION FAILED: $($file.Name)."
                   exit 1
               }
 
               $logQuery = "MERGE SchemaMigrations AS target USING (SELECT '$($file.Name)' AS ScriptName, '$hash' AS Checksum) AS src ON target.ScriptName = src.ScriptName WHEN MATCHED THEN UPDATE SET Checksum = src.Checksum, AppliedAt = GETDATE(), Status = 'Success' WHEN NOT MATCHED THEN INSERT (ScriptName, Checksum, Status) VALUES (src.ScriptName, src.Checksum, 'Success');"
-
               sqlcmd -S $server -E -d $database -Q $logQuery
               Write-Host "APPLIED: $($file.Name)"
           }
 
-          Write-Host "All scripts processed successfully."
+  report:
+    runs-on: self-hosted
+    needs: execute
+    if: success()
+    steps:
+      - name: Show applied migrations summary
+        shell: powershell
+        run: |
+          sqlcmd -S localhost\SQLEXPRESS -E -d MyAppDB -Q "SELECT ScriptName, AppliedAt, Status FROM SchemaMigrations ORDER BY AppliedAt DESC"
