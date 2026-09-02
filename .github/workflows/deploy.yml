@@ -2,7 +2,7 @@ name: Deploy SQL Changes
 
 on:
   push:
-    branches: [ master ]
+    branches: [ master, test ]
     paths:
       - 'schema/**.sql'
       - 'migrations/**.sql'
