@@ -14,11 +14,54 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Run SQL scripts
+      - name: Run SQL scripts with tracking and validation
         shell: powershell
         run: |
-          $files = Get-ChildItem -Path schema, migrations -Filter *.sql -Recurse -ErrorAction SilentlyContinue | Sort-Object Name
+          $ErrorActionPreference = "Stop"
+          $server = "localhost\SQLEXPRESS"
+          $database = "MyAppDB"
+
+          sqlcmd -S $server -E -i schema\000_create_schema_migrations_table.sql -b
+          if ($LASTEXITCODE -ne 0) { Write-Error "Failed to create tracking table"; exit 1 }
+
+          $files = Get-ChildItem -Path schema, migrations -Filter *.sql -Recurse -ErrorAction SilentlyContinue |
+                   Where-Object { $_.Name -ne "000_create_schema_migrations_table.sql" } |
+                   Sort-Object Name
+
           foreach ($file in $files) {
-            Write-Host "Running $($file.FullName)"
-            sqlcmd -S localhost\SQLEXPRESS -E -i $file.FullName
+              $content = Get-Content $file.FullName -Raw
+              if ([string]::IsNullOrWhiteSpace($content)) {
+                  Write-Error "VALIDATION FAILED: $($file.Name) is empty. Stopping pipeline."
+                  exit 1
+              }
+
+              $hash = [System.BitConverter]::ToString(
+                  [System.Security.Cryptography.SHA256]::Create().ComputeHash(
+                      [System.Text.Encoding]::UTF8.GetBytes($content)
+                  )
+              ) -replace '-', ''
+
+              $checkQuery = "SELECT Checksum FROM SchemaMigrations WHERE ScriptName = '$($file.Name)'"
+              $existing = sqlcmd -S $server -E -d $database -h -1 -Q $checkQuery
+              $existingChecksum = ($existing | Where-Object { $_.Trim() -ne "" } | Select-Object -First 1)
+
+              if ($existingChecksum -and $existingChecksum.Trim() -eq $hash) {
+                  Write-Host "SKIP: $($file.Name) already applied, unchanged."
+                  continue
+              }
+
+              Write-Host "RUNNING: $($file.Name)"
+              sqlcmd -S $server -E -d $database -i $file.FullName -b
+
+              if ($LASTEXITCODE -ne 0) {
+                  Write-Error "EXECUTION FAILED: $($file.Name). Stopping pipeline. No further scripts will run."
+                  exit 1
+              }
+
+              $logQuery = "MERGE SchemaMigrations AS target USING (SELECT '$($file.Name)' AS ScriptName, '$hash' AS Checksum) AS src ON target.ScriptName = src.ScriptName WHEN MATCHED THEN UPDATE SET Checksum = src.Checksum, AppliedAt = GETDATE(), Status = 'Success' WHEN NOT MATCHED THEN INSERT (ScriptName, Checksum, Status) VALUES (src.ScriptName, src.Checksum, 'Success');"
+
+              sqlcmd -S $server -E -d $database -Q $logQuery
+              Write-Host "APPLIED: $($file.Name)"
           }
+
+          Write-Host "All scripts processed successfully."
