@@ -138,17 +138,36 @@ jobs:
           $failed = $results | Where-Object { $_.Status -eq "Failed" -or $_.Status -eq "ValidationFailed" }
 
           if ($failed.Count -gt 0) {
-              Write-Host "FAILURES DETECTED — skipping tracking commit. Nothing will be marked as applied."
+              Write-Host "FAILURES DETECTED - skipping tracking commit. Nothing will be marked as applied."
               exit 0
           }
 
           $toCommit = $results | Where-Object { $_.Status -eq "ExecutedOk" }
+
           foreach ($r in $toCommit) {
-              $logQuery = "MERGE SchemaMigrations AS target USING (SELECT '$($r.Name)' AS ScriptName, '$($r.Checksum)' AS Checksum) AS src ON target.ScriptName = src.ScriptName WHEN MATCHED THEN UPDATE SET Checksum = src.Checksum, AppliedAt = GETDATE(), Status = 'Success' WHEN NOT MATCHED THEN INSERT (ScriptName, Checksum, Status) VALUES (src.ScriptName, src.Checksum, 'Success');"
-              sqlcmd -S $server -E -d $database -Q $logQuery
+              $safeName = $r.Name.Replace("'", "''")
+              $safeHash = $r.Checksum.Replace("'", "''")
+
+              $sql = "MERGE SchemaMigrations AS target " +
+                     "USING (SELECT '$safeName' AS ScriptName, '$safeHash' AS Checksum) AS src " +
+                     "ON target.ScriptName = src.ScriptName " +
+                     "WHEN MATCHED THEN UPDATE SET Checksum = src.Checksum, AppliedAt = GETDATE(), Status = 'Success' " +
+                     "WHEN NOT MATCHED THEN INSERT (ScriptName, Checksum, Status) VALUES (src.ScriptName, src.Checksum, 'Success');"
+
+              $tempSqlFile = "temp_merge_$([guid]::NewGuid().ToString('N')).sql"
+              $sql | Out-File -FilePath $tempSqlFile -Encoding utf8
+
+              sqlcmd -S $server -E -d $database -i $tempSqlFile
+              if ($LASTEXITCODE -ne 0) {
+                  Remove-Item $tempSqlFile -ErrorAction SilentlyContinue
+                  Write-Error "Failed to record tracking entry for $($r.Name)"
+                  exit 1
+              }
+
+              Remove-Item $tempSqlFile -ErrorAction SilentlyContinue
               Write-Host "TRACKED: $($r.Name)"
           }
-
+          
       - name: Consolidated report
         shell: powershell
         run: |
