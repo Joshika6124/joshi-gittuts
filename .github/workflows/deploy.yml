@@ -2,66 +2,187 @@ name: Deploy SQL Changes
 
 on:
   push:
-    branches: [ master, test ]
     paths:
-      - 'schema/**.sql'
-      - 'migrations/**.sql'
+      - '**.sql'
 
 jobs:
-  deploy:
+  database-pipeline:
     runs-on: self-hosted
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Run SQL scripts with tracking and validation
+      - name: Detect changed SQL scripts
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $before = "${{ github.event.before }}"
+          $after  = "${{ github.sha }}"
+
+          if ($before -eq "0000000000000000000000000000000000000000" -or [string]::IsNullOrWhiteSpace($before)) {
+              # First-ever push to this branch: treat every existing .sql file as "changed"
+              $changed = git ls-files "*.sql"
+          } else {
+              $changed = git diff --name-only --diff-filter=ACMR $before $after -- "*.sql"
+          }
+
+          $changed = $changed | Where-Object { $_ -and (Test-Path $_) }
+
+          if (-not $changed -or $changed.Count -eq 0) {
+              Write-Host "No SQL script changes detected. Nothing to do."
+              "NONE" | Out-File -FilePath changed_files.txt -Encoding utf8
+          } else {
+              $changed | Out-File -FilePath changed_files.txt -Encoding utf8
+          }
+
+      - name: Report how many scripts changed
+        shell: powershell
+        run: |
+          $list = Get-Content changed_files.txt
+          if ($list -eq "NONE") {
+              Write-Host "0 scripts changed."
+          } else {
+              Write-Host "$($list.Count) script(s) changed:"
+              $list | ForEach-Object { Write-Host " - $_" }
+          }
+
+      - name: Ensure tracking table exists
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          sqlcmd -S localhost\SQLEXPRESS -E -Q "
+          IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'SchemaMigrations')
+          BEGIN
+              CREATE TABLE SchemaMigrations (
+                  Id INT IDENTITY(1,1) PRIMARY KEY,
+                  ScriptName NVARCHAR(500) NOT NULL UNIQUE,
+                  Checksum NVARCHAR(64) NOT NULL,
+                  AppliedAt DATETIME DEFAULT GETDATE(),
+                  Status NVARCHAR(20) DEFAULT 'Success'
+              );
+          END" -d MyAppDB
+          if ($LASTEXITCODE -ne 0) { Write-Error "Could not verify/create tracking table."; exit 1 }
+
+      - name: Validate and execute each changed script in order
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
           $server = "localhost\SQLEXPRESS"
           $database = "MyAppDB"
 
-          sqlcmd -S $server -E -i schema\000_create_schema_migrations_table.sql -b
-          if ($LASTEXITCODE -ne 0) { Write-Error "Failed to create tracking table"; exit 1 }
+          $list = Get-Content changed_files.txt
+          $results = @()
 
-          $files = Get-ChildItem -Path schema, migrations -Filter *.sql -Recurse -ErrorAction SilentlyContinue |
-                   Where-Object { $_.Name -ne "000_create_schema_migrations_table.sql" } |
-                   Sort-Object Name
+          if ($list -ne "NONE") {
+              foreach ($path in $list) {
+                  $name = Split-Path $path -Leaf
+                  Write-Host "----"
+                  Write-Host "CHECKING: $name"
 
-          foreach ($file in $files) {
-              $content = Get-Content $file.FullName -Raw
-              if ([string]::IsNullOrWhiteSpace($content)) {
-                  Write-Error "VALIDATION FAILED: $($file.Name) is empty. Stopping pipeline."
-                  exit 1
+                  # --- VALIDATE ---
+                  $content = Get-Content $path -Raw -ErrorAction SilentlyContinue
+                  if ([string]::IsNullOrWhiteSpace($content)) {
+                      Write-Host "VALIDATE FAILED: $name is empty."
+                      $results += [PSCustomObject]@{ Name = $name; Path = $path; Status = "ValidationFailed"; Checksum = "" }
+                      continue
+                  }
+
+                  $hash = [System.BitConverter]::ToString(
+                      [System.Security.Cryptography.SHA256]::Create().ComputeHash(
+                          [System.Text.Encoding]::UTF8.GetBytes($content)
+                      )
+                  ) -replace '-', ''
+
+                  # --- CHECK IF ALREADY APPLIED, UNCHANGED ---
+                  $checkQuery = "SELECT Checksum FROM SchemaMigrations WHERE ScriptName = '$name'"
+                  $existing = sqlcmd -S $server -E -d $database -h -1 -Q $checkQuery
+                  $existingChecksum = ($existing | Where-Object { $_.Trim() -ne "" } | Select-Object -First 1)
+
+                  if ($existingChecksum -and $existingChecksum.Trim() -eq $hash) {
+                      Write-Host "SKIP: $name already applied, unchanged."
+                      $results += [PSCustomObject]@{ Name = $name; Path = $path; Status = "Skipped"; Checksum = $hash }
+                      continue
+                  }
+
+                  # --- EXECUTE ---
+                  Write-Host "EXECUTING: $name"
+                  sqlcmd -S $server -E -d $database -i $path -b
+                  if ($LASTEXITCODE -ne 0) {
+                      Write-Host "EXECUTION FAILED: $name"
+                      $results += [PSCustomObject]@{ Name = $name; Path = $path; Status = "Failed"; Checksum = $hash }
+                      continue
+                  }
+
+                  Write-Host "EXECUTED OK: $name"
+                  $results += [PSCustomObject]@{ Name = $name; Path = $path; Status = "ExecutedOk"; Checksum = $hash }
               }
-
-              $hash = [System.BitConverter]::ToString(
-                  [System.Security.Cryptography.SHA256]::Create().ComputeHash(
-                      [System.Text.Encoding]::UTF8.GetBytes($content)
-                  )
-              ) -replace '-', ''
-
-              $checkQuery = "SELECT Checksum FROM SchemaMigrations WHERE ScriptName = '$($file.Name)'"
-              $existing = sqlcmd -S $server -E -d $database -h -1 -Q $checkQuery
-              $existingChecksum = ($existing | Where-Object { $_.Trim() -ne "" } | Select-Object -First 1)
-
-              if ($existingChecksum -and $existingChecksum.Trim() -eq $hash) {
-                  Write-Host "SKIP: $($file.Name) already applied, unchanged."
-                  continue
-              }
-
-              Write-Host "RUNNING: $($file.Name)"
-              sqlcmd -S $server -E -d $database -i $file.FullName -b
-
-              if ($LASTEXITCODE -ne 0) {
-                  Write-Error "EXECUTION FAILED: $($file.Name). Stopping pipeline. No further scripts will run."
-                  exit 1
-              }
-
-              $logQuery = "MERGE SchemaMigrations AS target USING (SELECT '$($file.Name)' AS ScriptName, '$hash' AS Checksum) AS src ON target.ScriptName = src.ScriptName WHEN MATCHED THEN UPDATE SET Checksum = src.Checksum, AppliedAt = GETDATE(), Status = 'Success' WHEN NOT MATCHED THEN INSERT (ScriptName, Checksum, Status) VALUES (src.ScriptName, src.Checksum, 'Success');"
-
-              sqlcmd -S $server -E -d $database -Q $logQuery
-              Write-Host "APPLIED: $($file.Name)"
           }
 
-          Write-Host "All scripts processed successfully."
+          $results | ConvertTo-Json -Depth 3 | Out-File -FilePath results.json -Encoding utf8
+
+      - name: Commit tracking records only if everything succeeded
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $server = "localhost\SQLEXPRESS"
+          $database = "MyAppDB"
+
+          if (-not (Test-Path results.json)) {
+              Write-Host "No results to process."
+              exit 0
+          }
+
+          $results = Get-Content results.json | ConvertFrom-Json
+          $failed = $results | Where-Object { $_.Status -eq "Failed" -or $_.Status -eq "ValidationFailed" }
+
+          if ($failed.Count -gt 0) {
+              Write-Host "FAILURES DETECTED — skipping tracking commit. Nothing will be marked as applied."
+              exit 0
+          }
+
+          $toCommit = $results | Where-Object { $_.Status -eq "ExecutedOk" }
+          foreach ($r in $toCommit) {
+              $logQuery = "MERGE SchemaMigrations AS target USING (SELECT '$($r.Name)' AS ScriptName, '$($r.Checksum)' AS Checksum) AS src ON target.ScriptName = src.ScriptName WHEN MATCHED THEN UPDATE SET Checksum = src.Checksum, AppliedAt = GETDATE(), Status = 'Success' WHEN NOT MATCHED THEN INSERT (ScriptName, Checksum, Status) VALUES (src.ScriptName, src.Checksum, 'Success');"
+              sqlcmd -S $server -E -d $database -Q $logQuery
+              Write-Host "TRACKED: $($r.Name)"
+          }
+
+      - name: Consolidated report
+        shell: powershell
+        run: |
+          if (-not (Test-Path results.json)) {
+              Write-Host "No scripts were processed this run."
+              exit 0
+          }
+
+          $results = Get-Content results.json | ConvertFrom-Json
+          $ok      = $results | Where-Object { $_.Status -eq "ExecutedOk" }
+          $skipped = $results | Where-Object { $_.Status -eq "Skipped" }
+          $failed  = $results | Where-Object { $_.Status -eq "Failed" -or $_.Status -eq "ValidationFailed" }
+
+          Write-Host "===================== PIPELINE REPORT ====================="
+          Write-Host "Total scripts checked : $($results.Count)"
+          Write-Host "Executed successfully : $($ok.Count)"
+          Write-Host "Skipped (unchanged)   : $($skipped.Count)"
+          Write-Host "Failed                : $($failed.Count)"
+          Write-Host "============================================================="
+
+          if ($ok.Count -gt 0)      { Write-Host "`nSUCCESS:"; $ok      | ForEach-Object { Write-Host " - $($_.Name)" } }
+          if ($skipped.Count -gt 0) { Write-Host "`nSKIPPED:"; $skipped | ForEach-Object { Write-Host " - $($_.Name)" } }
+          if ($failed.Count -gt 0)  { Write-Host "`nFAILED:";  $failed  | ForEach-Object { Write-Host " - $($_.Name)" } }
+
+          # Also write to GitHub's Job Summary (shows nicely in the Actions UI)
+          "## Pipeline Report" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8
+          "- Total checked: $($results.Count)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "- Executed: $($ok.Count)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "- Skipped: $($skipped.Count)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "- Failed: $($failed.Count)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+          if ($failed.Count -gt 0) {
+              Write-Error "Pipeline finished with $($failed.Count) failed script(s). See report above."
+              exit 1
+          }
+
+          Write-Host "`nAll changes applied and tracked successfully."
