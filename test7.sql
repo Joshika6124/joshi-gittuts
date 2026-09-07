@@ -1,0 +1,3 @@
+USE MyAppDB;
+ALTER TABLE Users
+ADD ThisWillFail NVARCHAR(
