@@ -11,7 +11,7 @@ CREATE PROCEDURE dbo.AddProduct
     @StockQuantity INT
 AS
 BEGIN
-    INSERT INTO Products (Name, Price, StockQuantity)
-    VALUES (@Name, @Price, @StockQuantity);
+    INSERT INTO Products (Name, Price, StockQuantity, items)
+    VALUES (@Name, @Price, @StockQuantity, @items);
 END
 GO
