@@ -14,8 +14,8 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - name: Detect changed SQL scripts
+          
+      - name: Detect changed SQL scripts and sort into execution order
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
@@ -29,24 +29,151 @@ jobs:
               $changed = git diff --name-only --diff-filter=ACMR $before $after -- "*.sql"
           }
 
-          $changed = $changed | Where-Object { $_ -and (Test-Path $_) }
+          $changed = @($changed | Where-Object { $_ -and (Test-Path $_) })
 
-          if (-not $changed -or $changed.Count -eq 0) {
+          if ($changed.Count -eq 0) {
               Write-Host "No SQL script changes detected. Nothing to do."
               "NONE" | Out-File -FilePath changed_files.txt -Encoding utf8
-          } else {
-              $changed | Out-File -FilePath changed_files.txt -Encoding utf8
+              "[]"   | Out-File -FilePath plan.json -Encoding utf8
+              exit 0
           }
 
-      - name: Report how many scripts changed
+          # --- primary: read the actual SQL statement inside the file ---
+          function Get-PhaseFromContent {
+              param([string]$Path)
+
+              $raw = Get-Content -Path $Path -Raw -ErrorAction SilentlyContinue
+              if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
+
+              # Strip -- line comments and /* */ block comments so keywords
+              # inside comments or string literals in a comment don't match.
+              $c = [regex]::Replace($raw, '--[^\r\n]*', ' ')
+              $c = [regex]::Replace($c, '/\*[\s\S]*?\*/', ' ')
+
+              if ($c -match '(?im)msdb\.dbo\.sp_add_job|msdb\.dbo\.sp_add_jobstep|msdb\.dbo\.sp_add_schedule') {
+                  return @{ Num = 9; Label = "9. Jobs / Scheduler" }
+              }
+              if ($c -match '(?im)^\s*ALTER\s+TABLE\s+\S+\s+(WITH\s+(NO)?CHECK\s+)?ADD\s+CONSTRAINT') {
+                  return @{ Num = 4; Label = "4. Constraints" }
+              }
+              if ($c -match '(?im)^\s*ALTER\s+TABLE\b') {
+                  return @{ Num = 2; Label = "2. Table Alteration" }
+              }
+              if ($c -match '(?im)^\s*CREATE\s+TABLE\b') {
+                  return @{ Num = 1; Label = "1. Table Creation" }
+              }
+              if ($c -match '(?im)^\s*(INSERT\s+INTO|INSERT|UPDATE|DELETE\s+FROM|DELETE|MERGE)\b') {
+                  return @{ Num = 3; Label = "3. Data Migration" }
+              }
+              if ($c -match '(?im)^\s*CREATE\s+(UNIQUE\s+)?(NON)?CLUSTERED\s+INDEX\b|^\s*CREATE\s+(UNIQUE\s+)?INDEX\b') {
+                  return @{ Num = 5; Label = "5. Indexes" }
+              }
+              if ($c -match '(?im)^\s*CREATE\s+(OR\s+ALTER\s+)?VIEW\b|^\s*ALTER\s+VIEW\b') {
+                  return @{ Num = 6; Label = "6. Views" }
+              }
+              if ($c -match '(?im)^\s*CREATE\s+(OR\s+ALTER\s+)?FUNCTION\b|^\s*ALTER\s+FUNCTION\b') {
+                  return @{ Num = 7; Label = "7. Functions" }
+              }
+              if ($c -match '(?im)^\s*CREATE\s+(OR\s+ALTER\s+)?(PROC|PROCEDURE)\b|^\s*ALTER\s+(PROC|PROCEDURE)\b') {
+                  return @{ Num = 8; Label = "8. Stored Procedures" }
+              }
+
+              return $null
+          }
+
+          # --- fallback: folder / filename keyword, only used when the
+          #     content scan above found nothing (e.g. a file that's just
+          #     a comment block, or a batch separator with no statement) ---
+          $fallbackRules = @(
+              @{ Num = 9; Label = "9. Jobs / Scheduler";  Keywords = @("job", "schedul") }
+              @{ Num = 8; Label = "8. Stored Procedures"; Keywords = @("procedure", "stored proc", "usp_") }
+              @{ Num = 7; Label = "7. Functions";         Keywords = @("function", "udf") }
+              @{ Num = 6; Label = "6. Views";             Keywords = @("view") }
+              @{ Num = 5; Label = "5. Indexes";           Keywords = @("index") }
+              @{ Num = 4; Label = "4. Constraints";       Keywords = @("constraint") }
+              @{ Num = 3; Label = "3. Data Migration";    Keywords = @("insert", "update", "delete", "merge") }
+              @{ Num = 2; Label = "2. Table Alteration";  Keywords = @("alter") }
+              @{ Num = 1; Label = "1. Table Creation";    Keywords = @("create table", "tbl") }
+          )
+
+          function Get-PhaseFromNaming {
+              param([string]$Path, $Rules)
+
+              $folder = ((Split-Path $Path -Parent) -replace '\\', '/').ToLower()
+              $leaf   = (Split-Path $Path -Leaf).ToLower()
+
+              foreach ($rule in $Rules) {
+                  foreach ($k in $rule.Keywords) {
+                      if ($folder -like "*$k*" -or $leaf -like "*$k*") { return $rule }
+                  }
+              }
+              return $null
+          }
+
+          function Resolve-Phase {
+              param([string]$Path, $FallbackRules)
+
+              $result = Get-PhaseFromContent -Path $Path
+              if ($result) { return $result }
+
+              return Get-PhaseFromNaming -Path $Path -Rules $FallbackRules
+          }
+
+          $plan        = @()
+          $unclassified = @()
+
+          foreach ($path in $changed) {
+              $rule = Resolve-Phase -Path $path -FallbackRules $fallbackRules
+              if ($null -eq $rule) {
+                  $unclassified += $path
+                  continue
+              }
+              $plan += [PSCustomObject]@{
+                  Path       = $path
+                  Name       = Split-Path $path -Leaf
+                  Phase      = $rule.Num
+                  PhaseLabel = $rule.Label
+              }
+          }
+
+          if ($unclassified.Count -gt 0) {
+              Write-Host "Could not determine the phase for these scripts by reading their"
+              Write-Host "SQL content, and their folder/filename gave no reliable hint either:"
+              $unclassified | ForEach-Object { Write-Host " - $_" }
+              Write-Host ""
+              Write-Host "Open each one and confirm it contains a real CREATE/ALTER/INSERT/etc"
+              Write-Host "statement (not just comments or an empty batch), or add a recognisable"
+              Write-Host "keyword to its folder or filename as a fallback hint."
+              Write-Error "Unclassified SQL script(s) - refusing to run out of order."
+              exit 1
+          }
+
+          # Phase first, then filename inside the phase
+          $plan = @($plan | Sort-Object Phase, Name)
+
+          $plan | ConvertTo-Json -Depth 3 | Out-File -FilePath plan.json -Encoding utf8
+          $plan | ForEach-Object { $_.Path } | Out-File -FilePath changed_files.txt -Encoding utf8
+
+      - name: Show planned execution order
         shell: powershell
         run: |
-          $list = Get-Content changed_files.txt
-          if ($list -eq "NONE") {
+          $list = @(Get-Content changed_files.txt)
+          if ($list.Count -eq 0 -or $list[0] -eq "NONE") {
               Write-Host "0 scripts changed."
-          } else {
-              Write-Host "$($list.Count) script(s) changed:"
-              $list | ForEach-Object { Write-Host " - $_" }
+              exit 0
+          }
+
+          $plan = @(Get-Content plan.json | ConvertFrom-Json)
+
+          Write-Host "$($plan.Count) script(s) will run in this order:"
+          $position = 0
+          foreach ($group in ($plan | Group-Object PhaseLabel)) {
+              Write-Host ""
+              Write-Host "[$($group.Name)]"
+              foreach ($item in $group.Group) {
+                  $position++
+                  Write-Host ("  {0,2}. {1}" -f $position, $item.Path)
+              }
           }
 
       - name: Ensure tracking table exists
@@ -73,51 +200,90 @@ jobs:
           $server = "localhost\SQLEXPRESS"
           $database = "MyAppDB"
 
-          $list = Get-Content changed_files.txt
+          if (-not (Test-Path plan.json)) {
+              Write-Host "No plan to execute."
+              exit 0
+          }
+
+          $plan = @(Get-Content plan.json | ConvertFrom-Json)
           $results = @()
+          $stopped = $false
+          $currentPhase = ""
 
-          if ($list -ne "NONE") {
-              foreach ($path in $list) {
-                  $name = Split-Path $path -Leaf
-                  Write-Host "----"
-                  Write-Host "CHECKING: $name"
+          for ($i = 0; $i -lt $plan.Count; $i++) {
+              $item = $plan[$i]
+              $name = $item.Name
+              $path = $item.Path
 
-                  # --- VALIDATE ---
-                  $content = Get-Content $path -Raw -ErrorAction SilentlyContinue
-                  if ([string]::IsNullOrWhiteSpace($content)) {
-                      Write-Host "VALIDATE FAILED: $name is empty."
-                      $results += [PSCustomObject]@{ Name = $name; Path = $path; Status = "ValidationFailed"; Checksum = "" }
-                      continue
+              if ($stopped) {
+                  # An earlier phase failed - later phases depend on it, so don't try.
+                  $results += [PSCustomObject]@{
+                      Name = $name; Path = $path; Phase = $item.Phase
+                      PhaseLabel = $item.PhaseLabel; Status = "NotRun"; Checksum = ""
                   }
+                  continue
+              }
 
-                  $hash = [System.BitConverter]::ToString(
-                      [System.Security.Cryptography.SHA256]::Create().ComputeHash(
-                          [System.Text.Encoding]::UTF8.GetBytes($content)
-                      )
-                  ) -replace '-', ''
+              if ($item.PhaseLabel -ne $currentPhase) {
+                  $currentPhase = $item.PhaseLabel
+                  Write-Host ""
+                  Write-Host "=============================================="
+                  Write-Host "PHASE: $currentPhase"
+                  Write-Host "=============================================="
+              }
 
-                  # --- CHECK IF ALREADY APPLIED, UNCHANGED ---
-                  $checkQuery = "SELECT Checksum FROM SchemaMigrations WHERE ScriptName = '$name'"
-                  $existing = sqlcmd -S $server -E -d $database -h -1 -Q $checkQuery
-                  $existingChecksum = ($existing | Where-Object { $_.Trim() -ne "" } | Select-Object -First 1)
+              Write-Host "----"
+              Write-Host "CHECKING: $name"
 
-                  if ($existingChecksum -and $existingChecksum.Trim() -eq $hash) {
-                      Write-Host "SKIP: $name already applied, unchanged."
-                      $results += [PSCustomObject]@{ Name = $name; Path = $path; Status = "Skipped"; Checksum = $hash }
-                      continue
+              # --- VALIDATE ---
+              $content = Get-Content $path -Raw -ErrorAction SilentlyContinue
+              if ([string]::IsNullOrWhiteSpace($content)) {
+                  Write-Host "VALIDATE FAILED: $name is empty."
+                  $results += [PSCustomObject]@{
+                      Name = $name; Path = $path; Phase = $item.Phase
+                      PhaseLabel = $item.PhaseLabel; Status = "ValidationFailed"; Checksum = ""
                   }
+                  $stopped = $true
+                  continue
+              }
 
-                  # --- EXECUTE ---
-                  Write-Host "EXECUTING: $name"
-                  sqlcmd -S $server -E -d $database -i $path -b
-                  if ($LASTEXITCODE -ne 0) {
-                      Write-Host "EXECUTION FAILED: $name"
-                      $results += [PSCustomObject]@{ Name = $name; Path = $path; Status = "Failed"; Checksum = $hash }
-                      continue
+              $hash = [System.BitConverter]::ToString(
+                  [System.Security.Cryptography.SHA256]::Create().ComputeHash(
+                      [System.Text.Encoding]::UTF8.GetBytes($content)
+                  )
+              ) -replace '-', ''
+
+              # --- CHECK IF ALREADY APPLIED, UNCHANGED ---
+              $checkQuery = "SELECT Checksum FROM SchemaMigrations WHERE ScriptName = '$($name.Replace("'", "''"))'"
+              $existing = sqlcmd -S $server -E -d $database -h -1 -Q $checkQuery
+              $existingChecksum = ($existing | Where-Object { $_.Trim() -ne "" } | Select-Object -First 1)
+
+              if ($existingChecksum -and $existingChecksum.Trim() -eq $hash) {
+                  Write-Host "SKIP: $name already applied, unchanged."
+                  $results += [PSCustomObject]@{
+                      Name = $name; Path = $path; Phase = $item.Phase
+                      PhaseLabel = $item.PhaseLabel; Status = "Skipped"; Checksum = $hash
                   }
+                  continue
+              }
 
-                  Write-Host "EXECUTED OK: $name"
-                  $results += [PSCustomObject]@{ Name = $name; Path = $path; Status = "ExecutedOk"; Checksum = $hash }
+              # --- EXECUTE ---
+              Write-Host "EXECUTING: $name"
+              sqlcmd -S $server -E -d $database -i $path -b
+              if ($LASTEXITCODE -ne 0) {
+                  Write-Host "EXECUTION FAILED: $name - stopping, later phases depend on this."
+                  $results += [PSCustomObject]@{
+                      Name = $name; Path = $path; Phase = $item.Phase
+                      PhaseLabel = $item.PhaseLabel; Status = "Failed"; Checksum = $hash
+                  }
+                  $stopped = $true
+                  continue
+              }
+
+              Write-Host "EXECUTED OK: $name"
+              $results += [PSCustomObject]@{
+                  Name = $name; Path = $path; Phase = $item.Phase
+                  PhaseLabel = $item.PhaseLabel; Status = "ExecutedOk"; Checksum = $hash
               }
           }
 
@@ -135,15 +301,15 @@ jobs:
               exit 0
           }
 
-          $results = Get-Content results.json | ConvertFrom-Json
-          $failed = $results | Where-Object { $_.Status -eq "Failed" -or $_.Status -eq "ValidationFailed" }
+          $results = @(Get-Content results.json | ConvertFrom-Json)
+          $failed = @($results | Where-Object { $_.Status -eq "Failed" -or $_.Status -eq "ValidationFailed" })
 
           if ($failed.Count -gt 0) {
               Write-Host "FAILURES DETECTED - skipping tracking commit. Nothing will be marked as applied."
               exit 0
           }
 
-          $toCommit = $results | Where-Object { $_.Status -eq "ExecutedOk" }
+          $toCommit = @($results | Where-Object { $_.Status -eq "ExecutedOk" })
 
           foreach ($r in $toCommit) {
               $safeName = $r.Name.Replace("'", "''")
@@ -168,7 +334,7 @@ jobs:
               Remove-Item $tempSqlFile -ErrorAction SilentlyContinue
               Write-Host "TRACKED: $($r.Name)"
           }
-          
+
       - name: Consolidated report
         shell: powershell
         run: |
@@ -177,21 +343,27 @@ jobs:
               exit 0
           }
 
-          $results = Get-Content results.json | ConvertFrom-Json
-          $ok      = $results | Where-Object { $_.Status -eq "ExecutedOk" }
-          $skipped = $results | Where-Object { $_.Status -eq "Skipped" }
-          $failed  = $results | Where-Object { $_.Status -eq "Failed" -or $_.Status -eq "ValidationFailed" }
+          $results = @(Get-Content results.json | ConvertFrom-Json)
+          $ok      = @($results | Where-Object { $_.Status -eq "ExecutedOk" })
+          $skipped = @($results | Where-Object { $_.Status -eq "Skipped" })
+          $failed  = @($results | Where-Object { $_.Status -eq "Failed" -or $_.Status -eq "ValidationFailed" })
+          $notRun  = @($results | Where-Object { $_.Status -eq "NotRun" })
 
           Write-Host "===================== PIPELINE REPORT ====================="
           Write-Host "Total scripts checked : $($results.Count)"
           Write-Host "Executed successfully : $($ok.Count)"
           Write-Host "Skipped (unchanged)   : $($skipped.Count)"
           Write-Host "Failed                : $($failed.Count)"
+          Write-Host "Not run (blocked)     : $($notRun.Count)"
           Write-Host "============================================================="
 
-          if ($ok.Count -gt 0)      { Write-Host "`nSUCCESS:"; $ok      | ForEach-Object { Write-Host " - $($_.Name)" } }
-          if ($skipped.Count -gt 0) { Write-Host "`nSKIPPED:"; $skipped | ForEach-Object { Write-Host " - $($_.Name)" } }
-          if ($failed.Count -gt 0)  { Write-Host "`nFAILED:";  $failed  | ForEach-Object { Write-Host " - $($_.Name)" } }
+          Write-Host "`nBY PHASE:"
+          foreach ($group in ($results | Group-Object PhaseLabel | Sort-Object { $_.Group[0].Phase })) {
+              Write-Host "`n[$($group.Name)]"
+              foreach ($r in $group.Group) {
+                  Write-Host ("  {0,-16} {1}" -f $r.Status, $r.Name)
+              }
+          }
 
           # Also write to GitHub's Job Summary (shows nicely in the Actions UI)
           "## Pipeline Report" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8
@@ -199,6 +371,13 @@ jobs:
           "- Executed: $($ok.Count)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
           "- Skipped: $($skipped.Count)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
           "- Failed: $($failed.Count)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "- Not run: $($notRun.Count)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "| Phase | Script | Status |" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "| --- | --- | --- |" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          foreach ($r in ($results | Sort-Object Phase, Name)) {
+              "| $($r.PhaseLabel) | $($r.Name) | $($r.Status) |" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          }
 
           if ($failed.Count -gt 0) {
               Write-Error "Pipeline finished with $($failed.Count) failed script(s). See report above."
