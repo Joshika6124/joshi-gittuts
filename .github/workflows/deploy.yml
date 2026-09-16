@@ -14,7 +14,8 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          
+
+
       - name: Detect changed SQL scripts and sort into execution order
         shell: powershell
         run: |
@@ -200,12 +201,27 @@ jobs:
           $server = "localhost\SQLEXPRESS"
           $database = "MyAppDB"
 
+          # Skip cleanly when nothing changed. Important: don't try to parse
+          # plan.json in this case. On Windows PowerShell 5.1,
+          # '[]' | ConvertFrom-Json returns $null instead of an empty array,
+          # and @($null) is an array with ONE null element (not zero) - that
+          # then makes the loop below run once with a null path and crash.
+          $marker = Get-Content changed_files.txt -Raw -ErrorAction SilentlyContinue
+          if ($marker -and $marker.Trim() -eq "NONE") {
+              Write-Host "No SQL script changes in this push - nothing to execute."
+              exit 0
+          }
+
           if (-not (Test-Path plan.json)) {
               Write-Host "No plan to execute."
               exit 0
           }
 
           $plan = @(Get-Content plan.json | ConvertFrom-Json)
+          if ($plan.Count -eq 0 -or $null -eq $plan[0]) {
+              Write-Host "No scripts in plan - nothing to execute."
+              exit 0
+          }
           $results = @()
           $stopped = $false
           $currentPhase = ""
