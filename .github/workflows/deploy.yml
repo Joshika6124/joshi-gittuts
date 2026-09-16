@@ -15,7 +15,6 @@ jobs:
         with:
           fetch-depth: 0
 
-
       - name: Detect changed SQL scripts and sort into execution order
         shell: powershell
         run: |
@@ -35,7 +34,7 @@ jobs:
           if ($changed.Count -eq 0) {
               Write-Host "No SQL script changes detected. Nothing to do."
               "NONE" | Out-File -FilePath changed_files.txt -Encoding utf8
-              "[]"   | Out-File -FilePath plan.json -Encoding utf8
+              "" | Out-File -FilePath plan.txt -Encoding utf8
               exit 0
           }
 
@@ -152,7 +151,16 @@ jobs:
           # Phase first, then filename inside the phase
           $plan = @($plan | Sort-Object Phase, Name)
 
-          $plan | ConvertTo-Json -Depth 3 | Out-File -FilePath plan.json -Encoding utf8
+          # Plain tab-delimited text, one script per line - deliberately NOT
+          # JSON. Windows PowerShell 5.1's JSON round-trip has proven
+          # unreliable in this pipeline (an empty array becomes $null on
+          # read, and multi-object arrays can come back merged into one
+          # object with array-valued properties). A flat delimited file has
+          # none of those failure modes: one line in, one line out, always.
+          $plan | ForEach-Object {
+              "$($_.Phase)`t$($_.PhaseLabel)`t$($_.Name)`t$($_.Path)"
+          } | Out-File -FilePath plan.txt -Encoding utf8
+
           $plan | ForEach-Object { $_.Path } | Out-File -FilePath changed_files.txt -Encoding utf8
 
       - name: Show planned execution order
@@ -164,7 +172,11 @@ jobs:
               exit 0
           }
 
-          $plan = @(Get-Content plan.json | ConvertFrom-Json)
+          $planLines = @(Get-Content plan.txt | Where-Object { $_ -and $_.Trim() -ne "" })
+          $plan = $planLines | ForEach-Object {
+              $f = $_ -split "`t"
+              [PSCustomObject]@{ Phase = [int]$f[0]; PhaseLabel = $f[1]; Name = $f[2]; Path = $f[3] }
+          }
 
           Write-Host "$($plan.Count) script(s) will run in this order:"
           $position = 0
@@ -201,42 +213,40 @@ jobs:
           $server = "localhost\SQLEXPRESS"
           $database = "MyAppDB"
 
-          # Skip cleanly when nothing changed. Important: don't try to parse
-          # plan.json in this case. On Windows PowerShell 5.1,
-          # '[]' | ConvertFrom-Json returns $null instead of an empty array,
-          # and @($null) is an array with ONE null element (not zero) - that
-          # then makes the loop below run once with a null path and crash.
+          # Skip cleanly when nothing changed.
           $marker = Get-Content changed_files.txt -Raw -ErrorAction SilentlyContinue
           if ($marker -and $marker.Trim() -eq "NONE") {
               Write-Host "No SQL script changes in this push - nothing to execute."
               exit 0
           }
 
-          if (-not (Test-Path plan.json)) {
+          if (-not (Test-Path plan.txt)) {
               Write-Host "No plan to execute."
               exit 0
           }
 
-          $plan = @(Get-Content plan.json | ConvertFrom-Json)
-          if ($plan.Count -eq 0 -or $null -eq $plan[0]) {
+          $planLines = @(Get-Content plan.txt | Where-Object { $_ -and $_.Trim() -ne "" })
+          if ($planLines.Count -eq 0) {
               Write-Host "No scripts in plan - nothing to execute."
               exit 0
           }
-          $results = @()
+
+          $plan = $planLines | ForEach-Object {
+              $f = $_ -split "`t"
+              [PSCustomObject]@{ Phase = [int]$f[0]; PhaseLabel = $f[1]; Name = $f[2]; Path = $f[3] }
+          }
+
+          $resultLines = @()
           $stopped = $false
           $currentPhase = ""
 
-          for ($i = 0; $i -lt $plan.Count; $i++) {
-              $item = $plan[$i]
+          foreach ($item in $plan) {
               $name = $item.Name
               $path = $item.Path
 
               if ($stopped) {
                   # An earlier phase failed - later phases depend on it, so don't try.
-                  $results += [PSCustomObject]@{
-                      Name = $name; Path = $path; Phase = $item.Phase
-                      PhaseLabel = $item.PhaseLabel; Status = "NotRun"; Checksum = ""
-                  }
+                  $resultLines += "$($item.Phase)`t$($item.PhaseLabel)`t$name`t$path`tNotRun`t"
                   continue
               }
 
@@ -252,13 +262,10 @@ jobs:
               Write-Host "CHECKING: $name"
 
               # --- VALIDATE ---
-              $content = Get-Content $path -Raw -ErrorAction SilentlyContinue
+              $content = Get-Content -Path $path -Raw -ErrorAction SilentlyContinue
               if ([string]::IsNullOrWhiteSpace($content)) {
                   Write-Host "VALIDATE FAILED: $name is empty."
-                  $results += [PSCustomObject]@{
-                      Name = $name; Path = $path; Phase = $item.Phase
-                      PhaseLabel = $item.PhaseLabel; Status = "ValidationFailed"; Checksum = ""
-                  }
+                  $resultLines += "$($item.Phase)`t$($item.PhaseLabel)`t$name`t$path`tValidationFailed`t"
                   $stopped = $true
                   continue
               }
@@ -276,10 +283,7 @@ jobs:
 
               if ($existingChecksum -and $existingChecksum.Trim() -eq $hash) {
                   Write-Host "SKIP: $name already applied, unchanged."
-                  $results += [PSCustomObject]@{
-                      Name = $name; Path = $path; Phase = $item.Phase
-                      PhaseLabel = $item.PhaseLabel; Status = "Skipped"; Checksum = $hash
-                  }
+                  $resultLines += "$($item.Phase)`t$($item.PhaseLabel)`t$name`t$path`tSkipped`t$hash"
                   continue
               }
 
@@ -288,22 +292,16 @@ jobs:
               sqlcmd -S $server -E -d $database -i $path -b
               if ($LASTEXITCODE -ne 0) {
                   Write-Host "EXECUTION FAILED: $name - stopping, later phases depend on this."
-                  $results += [PSCustomObject]@{
-                      Name = $name; Path = $path; Phase = $item.Phase
-                      PhaseLabel = $item.PhaseLabel; Status = "Failed"; Checksum = $hash
-                  }
+                  $resultLines += "$($item.Phase)`t$($item.PhaseLabel)`t$name`t$path`tFailed`t$hash"
                   $stopped = $true
                   continue
               }
 
               Write-Host "EXECUTED OK: $name"
-              $results += [PSCustomObject]@{
-                  Name = $name; Path = $path; Phase = $item.Phase
-                  PhaseLabel = $item.PhaseLabel; Status = "ExecutedOk"; Checksum = $hash
-              }
+              $resultLines += "$($item.Phase)`t$($item.PhaseLabel)`t$name`t$path`tExecutedOk`t$hash"
           }
 
-          $results | ConvertTo-Json -Depth 3 | Out-File -FilePath results.json -Encoding utf8
+          $resultLines | Out-File -FilePath results.txt -Encoding utf8
 
       - name: Commit tracking records only if everything succeeded
         shell: powershell
@@ -312,12 +310,25 @@ jobs:
           $server = "localhost\SQLEXPRESS"
           $database = "MyAppDB"
 
-          if (-not (Test-Path results.json)) {
+          if (-not (Test-Path results.txt)) {
               Write-Host "No results to process."
               exit 0
           }
 
-          $results = @(Get-Content results.json | ConvertFrom-Json)
+          $resultLines = @(Get-Content results.txt | Where-Object { $_ -and $_.Trim() -ne "" })
+          if ($resultLines.Count -eq 0) {
+              Write-Host "No results to process."
+              exit 0
+          }
+
+          $results = $resultLines | ForEach-Object {
+              $f = $_ -split "`t"
+              [PSCustomObject]@{
+                  Phase = [int]$f[0]; PhaseLabel = $f[1]; Name = $f[2]
+                  Path = $f[3]; Status = $f[4]; Checksum = $(if ($f.Count -gt 5) { $f[5] } else { "" })
+              }
+          }
+
           $failed = @($results | Where-Object { $_.Status -eq "Failed" -or $_.Status -eq "ValidationFailed" })
 
           if ($failed.Count -gt 0) {
@@ -354,12 +365,25 @@ jobs:
       - name: Consolidated report
         shell: powershell
         run: |
-          if (-not (Test-Path results.json)) {
+          if (-not (Test-Path results.txt)) {
               Write-Host "No scripts were processed this run."
               exit 0
           }
 
-          $results = @(Get-Content results.json | ConvertFrom-Json)
+          $resultLines = @(Get-Content results.txt | Where-Object { $_ -and $_.Trim() -ne "" })
+          if ($resultLines.Count -eq 0) {
+              Write-Host "No scripts were processed this run."
+              exit 0
+          }
+
+          $results = $resultLines | ForEach-Object {
+              $f = $_ -split "`t"
+              [PSCustomObject]@{
+                  Phase = [int]$f[0]; PhaseLabel = $f[1]; Name = $f[2]
+                  Path = $f[3]; Status = $f[4]; Checksum = $(if ($f.Count -gt 5) { $f[5] } else { "" })
+              }
+          }
+
           $ok      = @($results | Where-Object { $_.Status -eq "ExecutedOk" })
           $skipped = @($results | Where-Object { $_.Status -eq "Skipped" })
           $failed  = @($results | Where-Object { $_.Status -eq "Failed" -or $_.Status -eq "ValidationFailed" })
