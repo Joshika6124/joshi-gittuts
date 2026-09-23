@@ -26,6 +26,9 @@ env:
   SOURCE_DIR: DBscripts                          # folder where your .sql files live
   ARCHIVE_DIR: DB scripts archive/sql archive     # parent folder that will hold timestamped copies
 
+permissions:
+  contents: write   # required so GITHUB_TOKEN can push the archived files back
+
 jobs:
   archive-sql:
     runs-on: self-hosted
