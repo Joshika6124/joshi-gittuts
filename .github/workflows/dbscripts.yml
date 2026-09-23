@@ -2,13 +2,15 @@ name: Archive SQL Files with Timestamp
 
 # -----------------------------------------------------------------------------
 # What this does:
-# 1. Watches the SOURCE_DIR folder for any added/changed .sql files.
-# 2. Creates a new timestamped folder inside ARCHIVE_DIR
-#    (e.g. sql-archive/20260923_143210/).
-# 3. Copies every .sql file from SOURCE_DIR into that timestamped folder,
-#    preserving the exact original subfolder structure (nested folders and
-#    all), using PowerShell.
-# 4. Commits and pushes the new timestamped folder back to the repo.
+# 1. Triggers on pushes that touch a .sql file under SOURCE_DIR.
+# 2. Diffs the push (before-commit -> after-commit) to find ONLY the .sql
+#    files that were actually added or changed in that push - not every
+#    file in the folder.
+# 3. Creates a new timestamped folder inside ARCHIVE_DIR
+#    (e.g. sql-archive/20260923_2-59-PM/).
+# 4. Copies just those changed .sql files into that timestamped folder,
+#    preserving their original subfolder path, using PowerShell.
+# 5. Commits and pushes the new timestamped folder back to the repo.
 #
 # Adjust SOURCE_DIR / ARCHIVE_DIR below to match your repo layout.
 # Runs on the self-hosted Windows runner using Windows PowerShell
@@ -55,6 +57,8 @@ jobs:
       - name: Copy SQL files preserving folder structure
         env:
           STAMP: ${{ steps.ts.outputs.stamp }}
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.sha }}
         run: |
           $ErrorActionPreference = "Stop"
 
@@ -66,20 +70,40 @@ jobs:
               exit 0
           }
 
+          $before = $env:BEFORE_SHA
+          $after  = $env:AFTER_SHA
+          $allZero = "0000000000000000000000000000000000000000"
+
+          # Figure out which .sql files were actually added/changed in this push.
+          # Manual runs (workflow_dispatch) have no "before" commit, so fall back
+          # to the files changed in the single most recent commit instead.
+          if ([string]::IsNullOrWhiteSpace($before) -or $before -eq $allZero) {
+              Write-Host "No previous commit to diff against - using the latest commit only."
+              $changed = git diff --name-only --diff-filter=ACMR "HEAD~1" "HEAD" -- "$src/**/*.sql" 2>$null
+              if (-not $changed) {
+                  # First-ever commit in the repo: nothing to diff against at all.
+                  $changed = git show --name-only --diff-filter=ACMR --pretty=format: "HEAD" -- "$src/**/*.sql"
+              }
+          } else {
+              $changed = git diff --name-only --diff-filter=ACMR $before $after -- "$src/**/*.sql"
+          }
+
+          $changed = @($changed | Where-Object { $_ -and (Test-Path $_) })
+
+          if ($changed.Count -eq 0) {
+              Write-Host "No new or changed .sql files in this push. Nothing to archive."
+              exit 0
+          }
+
           New-Item -ItemType Directory -Path $dest -Force | Out-Null
 
           $srcFull = (Resolve-Path $src).Path
 
-          $sqlFiles = Get-ChildItem -Path $src -Recurse -File -Filter *.sql
+          foreach ($relPath in $changed) {
+              $file = Get-Item -Path $relPath
 
-          if (-not $sqlFiles) {
-              Write-Host "No .sql files found under '$src'."
-              exit 0
-          }
-
-          foreach ($file in $sqlFiles) {
-              # Relative path of the file with respect to the source folder,
-              # e.g. reports\monthly.sql or reports/monthly.sql
+              # Relative path with respect to the source folder,
+              # e.g. Tables\Orders.sql
               $relativePath = $file.FullName.Substring($srcFull.Length).TrimStart('\','/')
 
               $destFilePath = Join-Path $dest $relativePath
@@ -89,8 +113,8 @@ jobs:
               Copy-Item -Path $file.FullName -Destination $destFilePath -Force
           }
 
-          Write-Host "Copied $($sqlFiles.Count) SQL file(s) into: $dest"
-          Get-ChildItem -Path $dest -Recurse -File | ForEach-Object { Write-Host $_.FullName }
+          Write-Host "Copied $($changed.Count) new/changed SQL file(s) into: $dest"
+          $changed | ForEach-Object { Write-Host " - $_" }
 
       - name: Commit and push timestamped archive
         env:
