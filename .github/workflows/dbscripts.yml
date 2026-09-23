@@ -17,7 +17,7 @@ name: Archive SQL Files with Timestamp
 
 on:
   push:
-    branches: [ main ]
+    branches: [ master ]
     paths:
       - 'DBscripts/**/*.sql'
   workflow_dispatch: {}   # allows manual runs from the Actions tab
