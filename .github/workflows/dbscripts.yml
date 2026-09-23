@@ -1,0 +1,107 @@
+name: Archive SQL Files with Timestamp
+
+# -----------------------------------------------------------------------------
+# What this does:
+# 1. Watches the SOURCE_DIR folder for any added/changed .sql files.
+# 2. Creates a new timestamped folder inside ARCHIVE_DIR
+#    (e.g. sql-archive/20260923_143210/).
+# 3. Copies every .sql file from SOURCE_DIR into that timestamped folder,
+#    preserving the exact original subfolder structure (nested folders and
+#    all), using PowerShell.
+# 4. Commits and pushes the new timestamped folder back to the repo.
+#
+# Adjust SOURCE_DIR / ARCHIVE_DIR below to match your repo layout.
+# PowerShell Core (pwsh) is preinstalled on GitHub-hosted ubuntu/windows/macos
+# runners, so this works as-is on ubuntu-latest. Switch to windows-latest if
+# you specifically need Windows PowerShell semantics.
+# -----------------------------------------------------------------------------
+
+on:
+  push:
+    branches: [ master ]
+    paths:
+      - 'DBscripts/**/*.sql'
+  workflow_dispatch: {}   # allows manual runs from the Actions tab
+
+env:
+  SOURCE_DIR: DBscripts                          # folder where your .sql files live
+  ARCHIVE_DIR: DB scripts archive/sql archive     # parent folder that will hold timestamped copies
+
+jobs:
+  archive-sql:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate timestamp
+        id: ts
+        run: |
+          # Colons aren't valid in folder/file names on Windows or in Git,
+          # so "2:59 PM" becomes "2-59-PM" (dash instead of colon).
+          $stamp = Get-Date -AsUTC -Format "yyyyMMdd_h-mm-tt"
+          "stamp=$stamp" >> $env:GITHUB_OUTPUT
+
+      - name: Copy SQL files preserving folder structure
+        env:
+          STAMP: ${{ steps.ts.outputs.stamp }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $src  = $env:SOURCE_DIR
+          $dest = Join-Path $env:ARCHIVE_DIR $env:STAMP
+
+          if (-not (Test-Path $src)) {
+              Write-Host "Source directory '$src' does not exist. Nothing to archive."
+              exit 0
+          }
+
+          New-Item -ItemType Directory -Path $dest -Force | Out-Null
+
+          $srcFull = (Resolve-Path $src).Path
+
+          $sqlFiles = Get-ChildItem -Path $src -Recurse -File -Filter *.sql
+
+          if (-not $sqlFiles) {
+              Write-Host "No .sql files found under '$src'."
+              exit 0
+          }
+
+          foreach ($file in $sqlFiles) {
+              # Relative path of the file with respect to the source folder,
+              # e.g. reports\monthly.sql or reports/monthly.sql
+              $relativePath = $file.FullName.Substring($srcFull.Length).TrimStart('\','/')
+
+              $destFilePath = Join-Path $dest $relativePath
+              $destFileDir  = Split-Path $destFilePath -Parent
+
+              New-Item -ItemType Directory -Path $destFileDir -Force | Out-Null
+              Copy-Item -Path $file.FullName -Destination $destFilePath -Force
+          }
+
+          Write-Host "Copied $($sqlFiles.Count) SQL file(s) into: $dest"
+          Get-ChildItem -Path $dest -Recurse -File | ForEach-Object { Write-Host $_.FullName }
+
+      - name: Commit and push timestamped archive
+        env:
+          STAMP: ${{ steps.ts.outputs.stamp }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          $archivePath = Join-Path $env:ARCHIVE_DIR $env:STAMP
+          git add $archivePath
+
+          git diff --cached --quiet
+          if ($LASTEXITCODE -eq 0) {
+              Write-Host "No changes to commit."
+          } else {
+              git commit -m "Archive SQL files -> $archivePath"
+              git push
+          }

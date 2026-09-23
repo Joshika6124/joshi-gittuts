@@ -3,8 +3,8 @@ name: Deploy SQL Changes
 on:
   push:
     paths:
-      - '**.sql'
-      - '.github/workflows/deploy.yml'
+      #- '**.sql'
+      #- '.github/workflows/deploy.yml'
 
 jobs:
   database-pipeline:
