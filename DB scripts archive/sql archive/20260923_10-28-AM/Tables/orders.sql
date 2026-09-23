@@ -1,0 +1,6 @@
+CREATE TABLE Orders (
+    OrderId     INT IDENTITY(1,1) PRIMARY KEY,
+    CustomerId  INT NOT NULL,
+    OrderDate   DATETIME NOT NULL DEFAULT GETDATE(),
+    TotalAmount DECIMAL(10, 2) NOT NULL DEFAULT 0
+);
