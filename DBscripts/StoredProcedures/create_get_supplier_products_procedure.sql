@@ -10,3 +10,5 @@ BEGIN
     SELECT ProductId, Name, Price, StockQuantity FROM Products WHERE SupplierId = @SupplierId;
 END
 GO
+
+#sqlarchieve
