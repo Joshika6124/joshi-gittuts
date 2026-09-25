@@ -49,9 +49,9 @@ jobs:
         run: |
           # Colons aren't valid in folder/file names on Windows or in Git,
           # so "2:59 PM" becomes "2-59-PM" (dash instead of colon).
-          # [DateTime]::UtcNow works in both Windows PowerShell 5.1 and
-          # PowerShell 7+ (Get-Date -AsUTC only exists in 7.1+).
-          $stamp = [DateTime]::UtcNow.ToString("yyyyMMdd_h-mm-tt")
+          # Uses the runner's LOCAL time (not UTC), since this is a
+          # self-hosted machine and folder names should match your clock.
+          $stamp = (Get-Date).ToString("yyyyMMdd_h-mm-tt")
           "stamp=$stamp" >> $env:GITHUB_OUTPUT
 
       - name: Copy SQL files preserving folder structure
