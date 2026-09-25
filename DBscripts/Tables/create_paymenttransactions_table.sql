@@ -10,3 +10,4 @@ BEGIN
         CONSTRAINT FK_PaymentTransactions_Orders FOREIGN KEY (OrderId) REFERENCES Orders(OrderId)
     );
 END
+
